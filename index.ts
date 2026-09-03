@@ -511,7 +511,7 @@ function memoryManagementPrompt(remote: RemoteState): string {
 function remoteSystemPrompt(systemPrompt: string, localCwd: string, remote: RemoteState): string {
   const workspacePrompt = systemPrompt.replace(
     `Current working directory: ${localCwd}`,
-    `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All read, write, edit, bash, and user shell operations run on this remote server, except for the explicitly identified local server-memory JSON file. Use remote with action disconnect to return to the local environment when requested.`,
+    `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All ssh_read, write, edit, bash, and user shell operations run on this remote server, except for the explicitly identified local server-memory JSON file. Use remote with action disconnect to return to the local environment when requested.`,
   );
   return `${workspacePrompt}\n\n${memoryManagementPrompt(remote)}`;
 }
@@ -1363,8 +1363,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   };
   pi.registerTool({
     ...localRead,
+    name: "ssh_read",
     description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue.`,
-    promptGuidelines: ["Use read with offset/limit for remote code and logs; inspect large files in focused chunks instead of reading them wholesale."],
+    promptGuidelines: ["Use ssh_read with offset/limit for remote code and logs; inspect large files in focused chunks instead of reading them wholesale."],
     execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
       ? executeRemoteRead(id, params, signal, update)
       : localRead.execute(id, params, signal, update),
