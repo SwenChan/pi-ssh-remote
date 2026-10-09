@@ -19,6 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Fixed
 
+- Suppressed `/remote` autocomplete while the cursor has non-whitespace command text after it, so Enter runs the existing command instead of inserting a duplicate completion.
 - Prevent `this.child.invalidate is not a function` crashes when Pi invalidates connection-result summaries, including historical results in resumed sessions, while preserving their fixed one-line display.
 - Avoid unnecessary password prompts on jump routes when a usable local default or configured private key is available.
 - Exposed the complete SSH command in agent context, connection/status/disconnect results, and connection failures instead of identifying jump-relative targets only by host and port.

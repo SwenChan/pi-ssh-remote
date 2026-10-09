@@ -32,7 +32,17 @@ import {
   type ReadOperations,
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, type AutocompleteItem, type Component, type Focusable } from "@earendil-works/pi-tui";
+import {
+  CURSOR_MARKER,
+  Key,
+  Text,
+  matchesKey,
+  truncateToWidth,
+  type AutocompleteItem,
+  type AutocompleteProvider,
+  type Component,
+  type Focusable,
+} from "@earendil-works/pi-tui";
 
 import { quote, shellWords } from "./src/shell.ts";
 import { cacheId, parseSshCommand, type ParsedSsh } from "./src/ssh/config.ts";
@@ -363,6 +373,23 @@ function getRemoteArgumentCompletions(prefix: string): AutocompleteItem[] | null
   }
 
   return null;
+}
+
+function suppressRemoteCompletionsBeforeSuffix(current: AutocompleteProvider): AutocompleteProvider {
+  return {
+    triggerCharacters: current.triggerCharacters,
+    async getSuggestions(lines, cursorLine, cursorCol, options) {
+      const line = lines[cursorLine] ?? "";
+      const remoteCommand = /^\s*\/remote(?=\s|$)/i.exec(line);
+      const afterCursor = line.slice(cursorCol);
+      if (remoteCommand && cursorCol >= remoteCommand[0].length && /\S/.test(afterCursor)) return null;
+      return current.getSuggestions(lines, cursorLine, cursorCol, options);
+    },
+    applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
+      current.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
+    shouldTriggerFileCompletion: (lines, cursorLine, cursorCol) =>
+      current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true,
+  };
 }
 
 function saveRemoteConfig(config: RemoteConfig): void {
@@ -1757,6 +1784,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     });
     currentCtx = ctx;
     sessionReady = true;
+    ctx.ui.addAutocompleteProvider(suppressRemoteCompletionsBeforeSuffix);
     status(ctx);
     const saved = loadSessionRemoteState(ctx);
     const canInheritCurrent = event.reason === "reload" || event.reason === "new" || event.reason === "fork";
