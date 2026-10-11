@@ -8,6 +8,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Added
 
+- None.
+
+### Changed
+
+- None.
+
+### Fixed
+
+- None.
+
+## [0.1.15] - 2026-10-11
+
+### Added
+
 - Added per-host `~/.ssh/config` resolution for host aliases/patterns, connection settings, identity files/agent, and ProxyJump, with independent configuration for every hop.
 - Added default Ed25519, ECDSA, and RSA private-key discovery for destinations and jump hosts without requiring OpenSSH.
 
@@ -264,7 +278,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.11...v0.1.12
