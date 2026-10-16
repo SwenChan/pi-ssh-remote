@@ -120,7 +120,7 @@ pi install npm:pi-ssh-remote
 需要返回本地时执行：
 
 ```text
-/remote off
+/remote disconnect
 ```
 
 ### 服务器记忆
@@ -154,7 +154,7 @@ pi install npm:pi-ssh-remote
 /remote ssh -i ~/.ssh/id_ed25519 root@gpu-box.example.com -p 2202
 ```
 
-密钥路径必须是绝对路径或以 `~/` 开头。插件支持未加密私钥和带 passphrase 的私钥；对于加密私钥，Pi 会以遮罩方式询问 passphrase，并仅在当前进程内缓存以便自动重连，`/remote forget` 会清除它。指定 `-i` 后只使用该私钥，不会静默回退到 SSH Agent 或密码；不带 `-i` 的旧命令仍保持原有的 SSH Agent 和密码登录流程。
+密钥路径必须是绝对路径或以 `~/` 开头。插件支持未加密私钥和带 passphrase 的私钥；对于加密私钥，Pi 会以遮罩方式询问 passphrase，并仅在当前进程内缓存以便自动重连，`/remote forget` 会清除它。指定 `-i` 后只使用该私钥，不会静默回退到 SSH Agent 或密码；不带 `-i` 时，每台主机依次尝试 SSH Agent、配置或默认私钥，最后才使用缓存密码或询问密码。默认私钥为 `~/.ssh/id_ed25519`、`~/.ssh/id_ecdsa` 和 `~/.ssh/id_rsa`，不存在的文件会跳过。
 
 ## 常见用法
 
@@ -244,7 +244,7 @@ pi install npm:pi-ssh-remote
 
 | 命令 | 作用 |
 |---|---|
-| `/remote ssh USER@HOST -p PORT [-i KEY]` | 保存并使用 Agent／密码或指定私钥连接服务器 |
+| `/remote ssh USER@HOST -p PORT [-i KEY]` | 保存并使用 SSH 配置、Agent、私钥或密码连接服务器 |
 | `/remote` | 连接当前选中的服务器，或提示输入 SSH 地址 |
 | `/remote config` | 查看已保存的服务器和配置 |
 | `/remote use USER@HOST:PORT` | 切换到指定服务器 |
@@ -265,9 +265,9 @@ pi install npm:pi-ssh-remote
 | `/remote config exec-max-lines 200` | 设置远端命令行数预算 |
 | `/remote config exec-max-bytes 8192` | 设置远端命令字节预算 |
 | `/remote config turn-max-bytes 32768` | 设置每轮远端工具总输出预算 |
-| `/remote status` | 查看当前连接和工作目录 |
-| `/remote reload` | 重新连接当前服务器 |
-| `/remote off` | 断开连接并返回本地 |
+| `/remote status` | 查看连接状态、完整 SSH 命令和工作目录 |
+| `/remote reload` / `/remote reconnect` | 恢复保存的工作区，支持断开后重连 |
+| `/remote disconnect` | 断开连接并返回本地 |
 | `/remote forget` | 断开连接并清除内存中的密码和密钥 passphrase |
 
 ## 配置保存在哪里
@@ -306,19 +306,53 @@ pi install npm:pi-ssh-remote
 - 各项限制可以配置，但不能超过扩展的硬安全上限；
 - 折叠显示行数最大为 50，只影响界面，不会增加模型输出。
 
+## 跳板机（ProxyJump）
+
+无需手动创建本地 SSH 隧道，可直接通过一个或多个跳板机连接：
+
+```text
+/remote ssh -J bastion@gateway.example.com:2222 developer@dev.internal
+/remote ssh -J bastion@gateway.example.com,relay@relay.internal developer@dev.internal
+/remote ssh -o ProxyJump=bastion@gateway.example.com developer@dev.internal
+```
+
+每一跳独立确认主机密钥、解析 SSH 配置并认证。`-i` 只用于目标主机；跳板机使用自己的配置／默认私钥或 SSH Agent。没有命令行或配置覆盖时，跳板端口默认为 22，用户名默认为本地用户名，而非目标主机用户名。IPv6 跳板地址使用方括号，例如 `user@[2001:db8::1]:2222`。
+
+重连会重新建立同一路径；断开会关闭整条连接链；`/remote forget` 也会清除该路径中跳板机的缓存凭据。跳板服务器必须允许向下一跳转发 TCP 连接。任何跳板失败时都不会回退为直连。
+
 ## 当前限制
 
-目前只支持 SSH 直连，以及 `-p`、`-l`、`-i` 参数。暂不读取 `~/.ssh/config` 或 ProxyJump；如需指定私钥，请显式使用 `-i`，不要依赖 SSH config 中的 `IdentityFile`。
+连接仍使用 Node.js `ssh2` 库，不依赖本地 OpenSSH 可执行程序。命令参数支持 `-p`、`-l`、`-i`、`-J` 和 `-o ProxyJump=...`，包括逗号分隔的多跳路径。
+
+读取 `~/.ssh/config` 中的 `Host` 通配／排除规则、`HostName`、`User`、`Port`、`IdentityFile`（可多条）、`IdentityAgent`、`IdentitiesOnly` 和 `ProxyJump`。命令行参数优先，每个跳板机独立解析。例如：
+
+```sshconfig
+Host gateway
+    HostName gateway.example.com
+    User bastion
+    IdentityFile ~/.ssh/gateway_key
+
+Host work
+    HostName dev.internal
+    User developer
+    ProxyJump gateway
+    IdentityFile ~/.ssh/work_key
+```
+
+使用 `/remote ssh work` 即可连接。未配置 `IdentityFile` 时，每一跳都会尝试上述默认私钥；因此普通 `ssh -J ...` 路径在两端均接受默认密钥时，也无需 SSH Agent。
+
+这只是明确支持的配置子集，不是完整 OpenSSH 兼容层：不读取系统 SSH 配置；拒绝 `Match` 段及对当前主机生效的 `Include`、`ProxyCommand` 或主机名规范化配置，其他配置项未实现。`IdentitiesOnly yes` 会完全禁用 Agent 认证，`IdentityAgent none` 同样禁用它。配置中的相对密钥路径以用户主目录为基准，支持 `~/` 和 `%d/%h/%n/%p/%r/%u/%%` token。
 
 ## 版本发布
 
-最新版本：[v0.1.12](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.12)
+最新版本：[v0.1.15](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.15)
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
+| [0.1.15](CHANGELOG.md#0115---2026-10-11) | 2026-10-11 | 按主机解析 SSH 配置并发现默认密钥、保留路由的重连，以及界面与补全修复 |
+| [0.1.14](CHANGELOG.md#0114---2026-09-28) | 2026-09-28 | ProxyJump 跳板连接、`/remote` 参数补全及更清晰的 SSH 工具路由 |
+| [0.1.13](CHANGELOG.md#0113---2026-09-18) | 2026-09-18 | 工作目录不可用时平滑回退、延长 SSH 握手等待并修复 Windows 路径 |
 | [0.1.12](CHANGELOG.md#0112---2026-08-25) | 2026-08-25 | 安全处理 SSH 握手期间断线所触发的连续错误 |
-| [0.1.11](CHANGELOG.md#0111---2026-08-16) | 2026-08-16 | JSON 记忆条目、Prompt 引导增删查改与 `/remote memory` 展示命令 |
-| [0.1.10](CHANGELOG.md#0110---2026-08-16) | 2026-08-16 | 默认安全读取且仅追加的服务器记忆 agent 更新逻辑 |
 
 完整的新增内容、行为变更和 Bug 修复记录请查看 [CHANGELOG.md](CHANGELOG.md)。
 

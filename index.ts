@@ -6,16 +6,17 @@
  * credentials, remote working directories, reconnection, and TCP forwarding.
  */
 
-import ssh2, { type Client as SshClient, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
-import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import type { Client as SshClient, ClientChannel, SFTPWrapper } from "ssh2";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   getAgentDir,
+  SettingsManager,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   createBashTool,
@@ -31,27 +32,30 @@ import {
   type ReadOperations,
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
+import {
+  CURSOR_MARKER,
+  Key,
+  Text,
+  matchesKey,
+  truncateToWidth,
+  type AutocompleteItem,
+  type AutocompleteProvider,
+  type Component,
+  type Focusable,
+} from "@earendil-works/pi-tui";
 
-const { Client, utils: ssh2Utils } = ssh2;
-
-interface ParsedSsh {
-  host: string;
-  port: number;
-  username: string;
-  identityFile?: string;
-  label: string;
-  command: string;
-}
+import { quote, shellWords } from "./src/shell.ts";
+import { cacheId, parseSshCommand, type ParsedSsh } from "./src/ssh/config.ts";
+import { createSshAuthenticator, type SshCredentialCache } from "./src/ssh/auth.ts";
+import { jumpSocket, probeFingerprint } from "./src/ssh/connection.ts";
 
 interface RemoteState extends ParsedSsh {
   client: SshClient;
   cwd: string;
+  unavailableCwd?: string;
 }
 
-interface CredentialCache {
-  passwords: Map<string, string>;
-  keyPassphrases: Map<string, string>;
+interface CredentialCache extends SshCredentialCache {
   resume?: { command: string; cwd: string; routeRemoteTools: boolean; forwards?: string[] };
 }
 
@@ -123,144 +127,16 @@ const MIN_MODEL_OUTPUT_BYTES = 1024;
 const OUTPUT_FOOTER_RESERVE_BYTES = 512;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
 const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
-const MAX_PRIVATE_KEY_BYTES = 1024 * 1024;
 const SESSION_STATE_ENTRY_TYPE = "pi-ssh-remote-state";
 const CACHE_KEY = "__piHpcCredentialCacheV1";
+const REMOTE_FILE_TOOL_ROUTING_DESCRIPTION = "With SSH routing active, this tool operates directly on the remote workspace.";
+const REMOTE_SHELL_TOOL_ROUTING_DESCRIPTION = "With SSH routing active, this tool runs directly in the remote workspace.";
 const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
 const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>(), keyPassphrases: new Map<string, string>() };
 credentialCache.keyPassphrases ??= new Map<string, string>();
 
-function shellWords(input: string): string[] {
-  const words: string[] = [];
-  let word = "";
-  let quoteChar: "'" | '"' | null = null;
-  let escaped = false;
-  for (const ch of input.trim()) {
-    if (escaped) { word += ch; escaped = false; continue; }
-    if (ch === "\\" && quoteChar !== "'") { escaped = true; continue; }
-    if (quoteChar) { if (ch === quoteChar) quoteChar = null; else word += ch; continue; }
-    if (ch === "'" || ch === '"') { quoteChar = ch; continue; }
-    if (/\s/.test(ch)) { if (word) { words.push(word); word = ""; } }
-    else word += ch;
-  }
-  if (escaped || quoteChar) throw new Error("Incomplete quoting or escaping in SSH command");
-  if (word) words.push(word);
-  return words;
-}
-
-function isHomeRelativePath(filePath: string): boolean {
-  return filePath === "~" || filePath.startsWith("~/");
-}
-
-function parseSshCommand(command: string): ParsedSsh {
-  const args = shellWords(command);
-  if (args[0] !== "ssh") throw new Error("Command must start with ssh, for example: ssh root@host -p 22");
-  let port = 22;
-  let username = process.env.USER || "root";
-  let identityFile: string | undefined;
-  let target: string | undefined;
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i]!;
-    if (arg === "-p") { port = Number(args[++i]); continue; }
-    if (arg.startsWith("-p") && arg.length > 2) { port = Number(arg.slice(2)); continue; }
-    if (arg === "-l") { username = args[++i] || username; continue; }
-    if (arg === "-i") {
-      if (identityFile !== undefined) throw new Error("Only one SSH identity file may be specified");
-      identityFile = args[++i];
-      if (!identityFile) throw new Error("SSH option -i requires a private key path");
-      continue;
-    }
-    if (arg.startsWith("-i") && arg.length > 2) {
-      if (identityFile !== undefined) throw new Error("Only one SSH identity file may be specified");
-      identityFile = arg.slice(2);
-      continue;
-    }
-    if (arg.startsWith("-")) throw new Error(`Unsupported SSH option ${arg}; only -p, -l, and -i are currently supported`);
-    if (!target) target = arg;
-    else throw new Error("Unexpected extra argument in SSH command");
-  }
-  if (!target || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid SSH host or port");
-  if (identityFile && !isHomeRelativePath(identityFile) && !isAbsolute(identityFile)) {
-    throw new Error("SSH identity file must use an absolute path or ~/...");
-  }
-  const at = target.lastIndexOf("@");
-  const host = at >= 0 ? target.slice(at + 1) : target;
-  if (at >= 0) username = target.slice(0, at);
-  if (!host || !username) throw new Error("Invalid SSH username or host");
-  return { host, port, username, ...(identityFile ? { identityFile } : {}), label: `${username}@${host}:${port}`, command };
-}
-
-function cacheId(config: ParsedSsh): string {
-  return `${config.username}@${config.host}:${config.port}`;
-}
-
 function serverMemoryId(config: ParsedSsh): string {
   return `${config.username}@${config.host}`;
-}
-
-function getCachedPassword(config: ParsedSsh): string | undefined {
-  return credentialCache.passwords.get(cacheId(config));
-}
-
-function setCachedPassword(config: ParsedSsh, password: string): void {
-  credentialCache.passwords.set(cacheId(config), password);
-}
-
-function deleteCachedPassword(config: ParsedSsh): void {
-  credentialCache.passwords.delete(cacheId(config));
-}
-
-function resolveIdentityPath(config: ParsedSsh): string {
-  if (!config.identityFile) throw new Error("No SSH identity file is configured");
-  // Expand ~ with the user home directory, not Pi's agent directory.
-  if (isHomeRelativePath(config.identityFile)) {
-    return config.identityFile === "~" ? homedir() : join(homedir(), config.identityFile.slice(2));
-  }
-  return config.identityFile;
-}
-
-function keyPassphraseId(config: ParsedSsh): string {
-  return `${cacheId(config)}|${resolveIdentityPath(config)}`;
-}
-
-function getCachedKeyPassphrase(config: ParsedSsh): string | undefined {
-  return credentialCache.keyPassphrases.get(keyPassphraseId(config));
-}
-
-function setCachedKeyPassphrase(config: ParsedSsh, passphrase: string): void {
-  credentialCache.keyPassphrases.set(keyPassphraseId(config), passphrase);
-}
-
-function deleteCachedKeyPassphrase(config: ParsedSsh): void {
-  if (config.identityFile) credentialCache.keyPassphrases.delete(keyPassphraseId(config));
-}
-
-function readPrivateKey(config: ParsedSsh): Buffer {
-  const path = resolveIdentityPath(config);
-  let stat;
-  try { stat = statSync(path); }
-  catch (error) { throw new Error(`Cannot access SSH private key ${path}: ${(error as Error).message}`); }
-  if (!stat.isFile()) throw new Error(`SSH private key is not a regular file: ${path}`);
-  if (stat.size > MAX_PRIVATE_KEY_BYTES) throw new Error(`SSH private key exceeds the ${MAX_PRIVATE_KEY_BYTES}-byte limit: ${path}`);
-  try { return readFileSync(path); }
-  catch (error) { throw new Error(`Cannot read SSH private key ${path}: ${(error as Error).message}`); }
-}
-
-function parsePrivateKey(keyData: Buffer, passphrase?: string): any | Error {
-  let parsed: any;
-  try { parsed = ssh2Utils.parseKey(keyData, passphrase); }
-  catch (error) { return error as Error; }
-  if (parsed instanceof Error) return parsed;
-  const keys = Array.isArray(parsed) ? parsed : [parsed];
-  const privateKeys = keys.filter((key) => key?.isPrivateKey?.());
-  if (privateKeys.length !== 1) {
-    return new Error(privateKeys.length ? "SSH identity files containing multiple private keys are not supported" : "SSH identity file does not contain a private key");
-  }
-  return privateKeys[0];
-}
-
-function isPassphraseError(error: Error): boolean {
-  return /passphrase|encrypted private/i.test(error.message);
 }
 
 function parseForwardSpec(value: string): ForwardSpec {
@@ -273,10 +149,6 @@ function parseForwardSpec(value: string): ForwardSpec {
     throw new Error(`Port out of range in forwarding specification: ${value}`);
   }
   return { localPort, remoteHost, remotePort };
-}
-
-function quote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function parseBoundedInteger(value: unknown, label: string, maximum: number): number {
@@ -405,6 +277,121 @@ function loadRemoteConfig(): RemoteConfig {
   catch { return {}; }
 }
 
+const REMOTE_TOP_LEVEL_COMPLETIONS: AutocompleteItem[] = [
+  { value: "ssh", label: "ssh", description: "Connect to USER@HOST" },
+  { value: "config", label: "config", description: "Show or change remote configuration" },
+  { value: "use", label: "use", description: "Select a saved endpoint" },
+  { value: "memory", label: "memory", description: "Show memory for the selected server" },
+  { value: "forward", label: "forward", description: "Start SSH port forwarding" },
+  { value: "unforward", label: "unforward", description: "Stop extension-managed port forwards" },
+  { value: "exec", label: "exec", description: "Run a command in the remote cwd" },
+  { value: "cd", label: "cd", description: "Change the remote working directory" },
+  { value: "status", label: "status", description: "Show the active SSH workspace" },
+  { value: "reload", label: "reload", description: "Reconnect the active SSH workspace" },
+  { value: "disconnect", label: "disconnect", description: "Disconnect and return tools to local execution" },
+  { value: "forget", label: "forget", description: "Disconnect and clear cached credentials" },
+];
+
+const REMOTE_CONFIG_COMPLETIONS: AutocompleteItem[] = [
+  { value: "note", label: "note", description: "Set or clear the endpoint note" },
+  { value: "cwd", label: "cwd", description: "Set the default remote working directory" },
+  { value: "forward", label: "forward", description: "Persist port-forward mappings" },
+  { value: "display-lines", label: "display-lines", description: "Set collapsed command preview lines" },
+  { value: "read-max-lines", label: "read-max-lines", description: "Set remote read line budget" },
+  { value: "read-max-bytes", label: "read-max-bytes", description: "Set remote read byte budget" },
+  { value: "exec-max-lines", label: "exec-max-lines", description: "Set command output line budget" },
+  { value: "exec-max-bytes", label: "exec-max-bytes", description: "Set command output byte budget" },
+  { value: "turn-max-bytes", label: "turn-max-bytes", description: "Set aggregate per-turn output budget" },
+];
+
+const REMOTE_EXEC_COMPLETIONS: AutocompleteItem[] = [
+  { value: "--timeout", label: "--timeout", description: "Override command timeout in seconds" },
+  { value: "--lines", label: "--lines", description: "Override collapsed preview line count" },
+];
+
+function filterAutocompleteItems(items: AutocompleteItem[], prefix: string): AutocompleteItem[] | null {
+  const needle = prefix.toLowerCase();
+  // Pi consumes Enter while an argument completion is active. A complete token
+  // must submit as-is, even if it is also a prefix of another saved endpoint.
+  if (items.some((item) => item.value.toLowerCase() === needle)) return null;
+  const matches = items.filter((item) => item.value.toLowerCase().startsWith(needle));
+  return matches.length ? matches : null;
+}
+
+function withCompletionPrefix(items: AutocompleteItem[], commandPrefix: string): AutocompleteItem[] {
+  return items.map((item) => ({ ...item, value: `${commandPrefix}${item.label ?? item.value}` }));
+}
+
+function completionTokenPrefix(input: string): { prefix: string; currentToken: string } {
+  const match = input.match(/^(.*\s)(\S*)$/s);
+  if (!match) return { prefix: "", currentToken: input };
+  return { prefix: match[1] ?? "", currentToken: match[2] ?? "" };
+}
+
+function getRemoteArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+  const input = prefix.replace(/^\/?remote(?:\s+|$)/i, "");
+  if (!input.includes(" ")) {
+    return filterAutocompleteItems(REMOTE_TOP_LEVEL_COMPLETIONS, input);
+  }
+
+  const useMatch = input.match(/^use\s+(.*)$/i);
+  if (useMatch) {
+    const config = loadRemoteConfig();
+    const endpoints: AutocompleteItem[] = Object.keys(config.endpoints ?? {}).map((key) => ({
+      value: key,
+      label: key,
+      description: key === config.activeEndpoint ? "Active endpoint" : "Saved endpoint",
+    }));
+    const matches = filterAutocompleteItems(endpoints, useMatch[1] ?? "");
+    return matches ? withCompletionPrefix(matches, "use ") : null;
+  }
+
+  const configMatch = input.match(/^config\s+(.*)$/i);
+  if (configMatch) {
+    const remainder = configMatch[1] ?? "";
+    if (!remainder.includes(" ")) {
+      const matches = filterAutocompleteItems(REMOTE_CONFIG_COMPLETIONS, remainder);
+      return matches ? withCompletionPrefix(matches, "config ") : null;
+    }
+    const noteMatch = remainder.match(/^note\s+(.*)$/i);
+    if (noteMatch) {
+      const matches = filterAutocompleteItems([{ value: "--clear", label: "--clear", description: "Clear the endpoint note" }], noteMatch[1] ?? "");
+      return matches ? withCompletionPrefix(matches, "config note ") : null;
+    }
+    return null;
+  }
+
+  const execMatch = input.match(/^exec\s+(.*)$/i);
+  if (execMatch) {
+    const remainder = execMatch[1] ?? "";
+    if (!remainder || remainder.startsWith("--")) {
+      const { prefix: execPrefix, currentToken } = completionTokenPrefix(remainder);
+      const matches = filterAutocompleteItems(REMOTE_EXEC_COMPLETIONS, currentToken);
+      return matches ? withCompletionPrefix(matches, `exec ${execPrefix}`) : null;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+function suppressRemoteCompletionsBeforeSuffix(current: AutocompleteProvider): AutocompleteProvider {
+  return {
+    triggerCharacters: current.triggerCharacters,
+    async getSuggestions(lines, cursorLine, cursorCol, options) {
+      const line = lines[cursorLine] ?? "";
+      const remoteCommand = /^\s*\/remote(?=\s|$)/i.exec(line);
+      const afterCursor = line.slice(cursorCol);
+      if (remoteCommand && cursorCol >= remoteCommand[0].length && /\S/.test(afterCursor)) return null;
+      return current.getSuggestions(lines, cursorLine, cursorCol, options);
+    },
+    applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
+      current.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
+    shouldTriggerFileCompletion: (lines, cursorLine, cursorCol) =>
+      current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true,
+  };
+}
+
 function saveRemoteConfig(config: RemoteConfig): void {
   mkdirSync(dirname(REMOTE_CONFIG_FILE), { recursive: true });
   writeFileSync(REMOTE_CONFIG_FILE, JSON.stringify(normalizeRemoteConfig(config), null, 2) + "\n", { mode: 0o600 });
@@ -423,9 +410,11 @@ function activeSshCommand(config = loadRemoteConfig()): string | undefined {
   return activeEndpointConfig(config)?.sshCommand;
 }
 
-function endpointDisplayLabel(endpoint: ParsedSsh, config = loadRemoteConfig()): string {
-  const note = endpointConfig(config, endpoint.command).note?.trim();
-  return note ? `${note} (${endpoint.label})` : endpoint.label;
+function endpointDisplayLabel(endpoint: ParsedSsh, cwd?: string): string {
+  const note = endpointConfig(loadRemoteConfig(), endpoint.command).note?.trim();
+  const label = `${note ? `${note} (${endpoint.label})` : endpoint.label}${cwd ? `:${cwd}` : ""}`;
+  const via = endpoint.jumps?.map((hop) => `${hop.host}${hop.port === 22 ? "" : `:${hop.port}`}`).join(" → ");
+  return via ? `${label} via ${via}` : label;
 }
 
 function serverMemoryFilePath(endpoint: ParsedSsh | string): string {
@@ -508,12 +497,8 @@ function memoryManagementPrompt(remote: RemoteState): string {
   return `Persistent memory for this SSH server is a local JSON file at ${path}. This exact path is always handled by Pi's local read, write, and edit tools even while other tools are routed over SSH. The file schema is {"server":"${serverMemoryId(remote)}","entries":[{"id":"stable-unique-id","content":"memory text"}]}. If the file does not exist, create it with that server value and an empty entries array. Read the file before changing it and preserve valid JSON plus all unrelated entries. Add by appending one object with a unique stable id; query by reading the file; update by editing only the matching id. DELETE SAFETY: delete an entry only when the user explicitly asks to delete, remove, or forget server memory. Before deleting, read the file and identify the exact id; if the target is ambiguous, ask the user. Use edit to remove only that exact object and preserve every other entry. Never treat a correction or replacement request as permission to delete, and never delete all entries unless the user explicitly requests deletion of all server memory.`;
 }
 
-function remoteSystemPrompt(systemPrompt: string, localCwd: string, remote: RemoteState): string {
-  const workspacePrompt = systemPrompt.replace(
-    `Current working directory: ${localCwd}`,
-    `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All ssh_read, write, edit, bash, and user shell operations run on this remote server, except for the explicitly identified local server-memory JSON file. Use remote with action disconnect to return to the local environment when requested.`,
-  );
-  return `${workspacePrompt}\n\n${memoryManagementPrompt(remote)}`;
+function remoteWorkspacePrompt(remote: RemoteState): string {
+  return `SSH workspace: ${endpointDisplayLabel(remote, remote.cwd)}. The standard ssh_read, write, edit, and bash tools and user shell commands operate directly in this workspace.`;
 }
 
 function serverMemoryContext(remote: RemoteState): string | undefined {
@@ -656,9 +641,43 @@ function previewRemoteOutput(output: string, displayLines: number): string {
   return truncateTail(output, { maxLines: displayLines, maxBytes: DEFAULT_MAX_BYTES }).content || "Remote command completed.";
 }
 
+function renderRemoteControlCall(params: any, theme: any): Component {
+  const args = params ?? {};
+  const action = typeof args.action === "string" && args.action ? args.action : "...";
+  const stringArg = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
+  let operand: string | undefined;
+
+  if (action === "exec") {
+    operand = `$ ${stringArg(args.remoteCommand) || "..."}`;
+  } else if (action === "connect") {
+    operand = stringArg(args.command);
+  } else if (action === "forward") {
+    const forwards = stringArg(args.forwards);
+    if (forwards !== undefined) operand = forwards || "...";
+  } else if (action === "chdir") {
+    operand = stringArg(args.cwd) || "...";
+  } else if (action === "note") {
+    const note = stringArg(args.note);
+    operand = note === undefined || note.trim() === "" ? "clear note" : note.trim();
+  } else if (action === "memory") {
+    operand = stringArg(args.command);
+  }
+
+  const title = theme.fg("toolTitle", theme.bold("remote"));
+  const actionText = theme.fg("muted", ` ${action}`);
+  const operandText = operand ? theme.fg("accent", `  ${operand}`) : "";
+  return new Text(`${title}${actionText}${operandText}`, 0, 0);
+}
+
 function renderRemoteControlResult(result: any, expanded: boolean, theme: any): Component {
   const fallback = result.content?.find((item: any) => item.type === "text")?.text ?? "";
   const details = result.details;
+  if (details?.summary) {
+    return {
+      render: (width: number) => [truncateToWidth(details.summary, width)],
+      invalidate() {}, // Stateless: the summary is rendered afresh at each width.
+    };
+  }
   if (details?.action !== "exec") return new Text(fallback, 0, 0);
 
   const output = details.output || fallback;
@@ -686,57 +705,6 @@ function renderRemoteControlResult(result: any, expanded: boolean, theme: any): 
     },
     invalidate() {},
   };
-}
-
-function probeFingerprint(config: ParsedSsh): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const client = new Client();
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) { settled = true; client.end(); reject(new Error("Connection timed out")); }
-    }, 10000);
-    client.on("error", (error) => {
-      if (!settled) { settled = true; clearTimeout(timer); reject(error); }
-    });
-    client.connect({
-      host: config.host,
-      port: config.port,
-      username: config.username,
-      readyTimeout: 8000,
-      hostHash: "sha256",
-      hostVerifier: (hash) => {
-        if (!settled) { settled = true; clearTimeout(timer); resolve(hash); }
-        setImmediate(() => client.end());
-        return false;
-      },
-    });
-  });
-}
-
-type SshAuthentication = Partial<Pick<ConnectConfig, "password" | "privateKey" | "passphrase" | "agent">>;
-
-function connect(config: ParsedSsh, authentication: SshAuthentication, fingerprint: string): Promise<SshClient> {
-  return new Promise((resolve, reject) => {
-    const client = new Client();
-    const options: ConnectConfig = {
-      host: config.host,
-      port: config.port,
-      username: config.username,
-      ...authentication,
-      readyTimeout: 12000,
-      keepaliveInterval: 15000,
-      keepaliveCountMax: 3,
-      hostHash: "sha256",
-      hostVerifier: (hash) => hash === fingerprint,
-    };
-    client.once("ready", () => resolve(client));
-    // ssh2 may emit a socket error followed by a protocol error while a
-    // connection is lost during handshake. Keep consuming client errors after
-    // the first one so EventEmitter does not turn the follow-up into an
-    // uncaught exception; rejecting an already-settled promise is a no-op.
-    client.on("error", reject);
-    client.connect(options);
-  });
 }
 
 function execRemote(
@@ -862,12 +830,9 @@ async function askSecret(ctx: any, label: string, placeholder: string): Promise<
     new SecretInput(label, done, () => tui.requestRender()));
 }
 
-async function askPassword(ctx: any): Promise<string | null> {
-  return askSecret(ctx, "SSH password", "password");
-}
-
 export default function sshRemoteExtension(pi: ExtensionAPI) {
   migrateLegacyServerMemories();
+  const auth = createSshAuthenticator(credentialCache);
 
   const localCwd = process.cwd();
   let remote: RemoteState | null = null;
@@ -880,6 +845,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   let restoringSessionState = false;
   let lastConnectionError: string | undefined;
   let lastCommand = credentialCache.resume?.command ?? activeSshCommand() ?? "";
+  let lastCwd = credentialCache.resume?.cwd;
   let turnOutputBytes = 0;
 
   const configuredCwd = (command: string): string =>
@@ -888,32 +854,31 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const configuredForwards = (command: string): string[] =>
     endpointConfig(loadRemoteConfig(), command).forwards ?? [];
 
-  const standardAuthentication = (password?: string): SshAuthentication => ({
-    ...(password ? { password } : {}),
-    ...(process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
+  const connectionDescription = (): string => {
+    const command = remote?.command || lastCommand;
+    const state = `SSH remote: ${remote ? "connected" : "disconnected"}; tool routing: ${routeRemoteTools ? "remote" : "local"}.`;
+    if (!command) return state;
+    const cwd = remote?.cwd ?? lastCwd ?? configuredCwd(command);
+    return `${state}\nSSH command: ${command}\nRemote cwd: ${cwd}\nResume: remote(action="reconnect")`;
+  };
+
+  const connectionResult = (summary: string, extra: Record<string, unknown> = {}) => ({
+    content: [{ type: "text" as const, text: `${summary}\n${connectionDescription()}` }],
+    details: {
+      summary,
+      connected: Boolean(remote),
+      command: remote?.command || lastCommand || undefined,
+      cwd: remote?.cwd ?? lastCwd ?? (lastCommand ? configuredCwd(lastCommand) : undefined),
+      toolRouting: routeRemoteTools ? "remote" : "local",
+      ...extra,
+    },
   });
 
-  const privateKeyAuthentication = async (parsed: ParsedSsh, ctx?: any): Promise<SshAuthentication> => {
-    const keyData = readPrivateKey(parsed);
-    let passphrase = getCachedKeyPassphrase(parsed);
-    let privateKey = parsePrivateKey(keyData, passphrase);
-    if (privateKey instanceof Error && isPassphraseError(privateKey)) {
-      if (passphrase) deleteCachedKeyPassphrase(parsed);
-      if (!ctx) throw new Error(`SSH private key ${resolveIdentityPath(parsed)} requires its passphrase again; reconnect interactively`);
-      passphrase = await askSecret(ctx, `Passphrase for ${parsed.identityFile}`, "private key passphrase") ?? undefined;
-      if (!passphrase) throw new Error("No SSH private key passphrase was provided");
-      privateKey = parsePrivateKey(keyData, passphrase);
-      if (privateKey instanceof Error) {
-        deleteCachedKeyPassphrase(parsed);
-        throw new Error(`Could not unlock SSH private key ${resolveIdentityPath(parsed)}: ${privateKey.message}`);
-      }
-      setCachedKeyPassphrase(parsed, passphrase);
-    }
-    if (privateKey instanceof Error) {
-      throw new Error(`Invalid SSH private key ${resolveIdentityPath(parsed)}: ${privateKey.message}`);
-    }
-    return { privateKey: keyData, ...(passphrase ? { passphrase } : {}) };
-  };
+  const connectionErrorResult = (message: string) => ({
+    content: [{ type: "text" as const, text: message }],
+    details: { summary: message.split("\n")[0] },
+    isError: true,
+  });
 
   const mapPath = (path: string): string => {
     if (!remote) return path;
@@ -939,7 +904,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     cwd: remote.cwd,
     routeRemoteTools,
     forwards: [...forwardSpecs.values()].map(serializeForward),
-  } : { version: 1, connected: false };
+  } : {
+    version: 1,
+    connected: false,
+    ...(lastCommand ? { command: lastCommand, cwd: lastCwd ?? configuredCwd(lastCommand) } : {}),
+  };
 
   const persistSessionRemoteState = (): void => {
     if (!sessionReady || restoringSessionState) return;
@@ -1018,7 +987,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const status = (ctx: any) => {
     currentCtx = ctx;
     if (!remote) ctx.ui.setStatus("ssh-remote", undefined);
-    else if (routeRemoteTools) ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `${endpointDisplayLabel(remote)}:${remote.cwd}`));
+    else if (routeRemoteTools) ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", endpointDisplayLabel(remote, remote.cwd)));
     else ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `tunnel ${[...forwardServers.keys()].join(",") || endpointDisplayLabel(remote)}`));
   };
 
@@ -1030,48 +999,111 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         currentCtx.ui.setStatus("ssh-remote", currentCtx.ui.theme.fg("warning", `reconnecting ${endpointDisplayLabel(state)}…`));
       }
       void reconnectRemote().catch((error) => {
-        if (currentCtx) currentCtx.ui.notify(`SSH remote automatic reconnection failed: ${(error as Error).message}`, "error");
+        if (currentCtx) currentCtx.ui.notify(`SSH remote automatic reconnection failed: ${(error as Error).message.split("\n")[0]}`, "error");
       });
     });
   };
 
-  const establish = async (parsed: ParsedSsh, authentication: SshAuthentication, cwd: string): Promise<RemoteState> => {
-    const key = `${parsed.host}:${parsed.port}`;
-    const fingerprint = loadKnownHosts()[key];
-    if (!fingerprint) throw new Error(`Host ${key} is not trusted; connect interactively with /remote first`);
-    const client = await connect(parsed, authentication, fingerprint);
+  const connectRoute = async (parsed: ParsedSsh, ctx?: any): Promise<SshClient> => {
+    const clients: SshClient[] = [];
+    let connectingHop = parsed;
+    let closed = false;
+    const closeRoute = () => {
+      if (closed) return;
+      closed = true;
+      for (const client of [...clients].reverse()) client.destroy();
+    };
     try {
-      const cdCommand = cwd === FALLBACK_REMOTE_CWD ? "cd -- ~" : `cd -- ${quote(cwd)}`;
-      const resolved = (await execRemote(client, `${cdCommand} && pwd -P`)).toString().trim();
-      const state = { ...parsed, client, cwd: resolved };
-      attachClient(state);
-      return state;
+      for (const hop of [...(parsed.jumps ?? []), parsed]) {
+        connectingHop = hop;
+        const parent = clients.at(-1);
+        const socket = () => parent ? jumpSocket(parent, hop) : Promise.resolve(undefined);
+        const key = `${hop.host}:${hop.port}`;
+        let fingerprint = loadKnownHosts()[key];
+        if (ctx) {
+          const probed = await probeFingerprint(hop, await socket());
+          if (fingerprint !== probed) {
+            const trusted = await ctx.ui.confirm(
+              fingerprint ? "SSH host key changed" : "Trust SSH host",
+              fingerprint
+                ? `${hop.label}\nPrevious key: ${displayFingerprint(fingerprint)}\nNew key: ${displayFingerprint(probed)}\nVerify the server identity. Update the saved key and continue?`
+                : `${hop.label}\nHost key: ${displayFingerprint(probed)}\nTrust and save this key?`,
+            );
+            if (!trusted) throw new Error(`The host key for ${hop.label} was not trusted`);
+            saveKnownHost(key, probed);
+          }
+          fingerprint = probed;
+        }
+        if (!fingerprint) throw new Error(`Host ${key} is not trusted; connect interactively with /remote first`);
+        const client = await auth.authenticateHop(hop, fingerprint, socket,
+          ctx ? (label, placeholder) => askSecret(ctx, label, placeholder) : undefined);
+        if (closed) { client.destroy(); throw new Error("SSH jump connection closed during connection setup"); }
+        clients.push(client);
+        client.once("close", closeRoute);
+      }
+      return clients.at(-1)!;
     } catch (error) {
-      client.end();
-      throw error;
+      closeRoute();
+      throw new Error(`SSH hop ${connectingHop.label}: ${(error as Error).message}`);
     }
   };
 
-  async function reconnectRemote(): Promise<RemoteState> {
+  const establish = async (parsed: ParsedSsh, cwd: string, ctx?: any): Promise<RemoteState> => {
+    let client: SshClient | undefined;
+    try {
+      client = await connectRoute(parsed, ctx);
+      const cdCommand = cwd === FALLBACK_REMOTE_CWD ? "cd -- ~" : `cd -- ${quote(cwd)}`;
+      let resolved: string;
+      let unavailableCwd: string | undefined;
+      try {
+        resolved = (await execRemote(client, `${cdCommand} && pwd -P`)).toString().trim();
+      } catch (error) {
+        if (cwd === FALLBACK_REMOTE_CWD) throw error;
+        unavailableCwd = cwd;
+        resolved = (await execRemote(client, "cd -- ~ && pwd -P")).toString().trim();
+      }
+      const state = { ...parsed, client, cwd: resolved, ...(unavailableCwd ? { unavailableCwd } : {}) };
+      attachClient(state);
+      return state;
+    } catch (error) {
+      client?.end();
+      throw new Error(`${(error as Error).message}\nSSH command: ${parsed.command}`);
+    }
+  };
+
+  async function reconnectRemote(ctx = currentCtx): Promise<RemoteState> {
     if (reconnectPromise) return reconnectPromise;
     const resumeRouting = remote ? routeRemoteTools : (credentialCache.resume?.routeRemoteTools ?? true);
     const source = remote ?? (credentialCache.resume ? { ...parseSshCommand(credentialCache.resume.command), cwd: credentialCache.resume.cwd } : null);
-    if (!source) throw new Error("No SSH remote connection is available to reconnect");
+    if (!source) {
+      if (!lastCommand) throw new Error("No SSH remote connection is available to reconnect");
+      reconnectPromise = connectInteractive(lastCommand, ctx, lastCwd ?? configuredCwd(lastCommand))
+        .then((state) => {
+          if (!state) throw new Error(lastConnectionError || "SSH remote reconnection was cancelled or failed");
+          return state;
+        })
+        .finally(() => { reconnectPromise = null; });
+      return reconnectPromise;
+    }
     const parsed = parseSshCommand(source.command);
-    const password = getCachedPassword(parsed);
     reconnectPromise = (async () => {
-      const authentication = parsed.identityFile
-        ? await privateKeyAuthentication(parsed)
-        : standardAuthentication(password);
       const oldClient = remote?.client;
-      const next = await establish(parsed, authentication, source.cwd);
+      const next = await establish(parsed, source.cwd);
       remote = next;
       routeRemoteTools = resumeRouting;
       credentialCache.resume = { command: parsed.command, cwd: next.cwd, routeRemoteTools, forwards: credentialCache.resume?.forwards };
+      lastCommand = parsed.command;
+      lastCwd = next.cwd;
+      saveEndpointConfig(parsed.command, { remoteCwd: next.cwd }, true);
+      persistSessionRemoteState();
       oldClient?.end();
       if (currentCtx) {
         status(currentCtx);
-        currentCtx.ui.notify(`SSH remote reconnected automatically: ${endpointDisplayLabel(next)}:${next.cwd}`, "info");
+        if (next.unavailableCwd) {
+          currentCtx.ui.notify(`SSH remote directory unavailable: ${next.unavailableCwd}; reconnected in default directory ${next.cwd}`, "warning");
+        } else {
+          currentCtx.ui.notify(`SSH remote reconnected automatically: ${endpointDisplayLabel(next, next.cwd)}`, "info");
+        }
       }
       return next;
     })().finally(() => { reconnectPromise = null; });
@@ -1097,6 +1129,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       `cd -- ${quote(remote!.cwd)} && ${targetCommand} && pwd -P`,
     ))).toString().trim();
     remote.cwd = resolved;
+    lastCommand = remote.command;
+    lastCwd = resolved;
     credentialCache.resume = { command: remote.command, cwd: resolved, routeRemoteTools, forwards: [...forwardSpecs.values()].map(serializeForward) };
     saveEndpointConfig(remote.command, { remoteCwd: resolved }, true);
     status(ctx);
@@ -1124,62 +1158,37 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return null;
     }
     lastConnectionError = undefined;
-
-    const key = `${parsed.host}:${parsed.port}`;
-    const savedFingerprint = loadKnownHosts()[key];
-    const fingerprint = await probeFingerprint(parsed);
-    if (!savedFingerprint) {
-      const trusted = await ctx.ui.confirm("Trust SSH host", `${parsed.label}\nHost key: ${displayFingerprint(fingerprint)}\nTrust and save this key?`);
-      if (!trusted) { lastConnectionError = "The host key was not trusted"; return null; }
-      saveKnownHost(key, fingerprint);
-    } else if (savedFingerprint !== fingerprint) {
-      const trusted = await ctx.ui.confirm(
-        "SSH host key changed",
-        `${parsed.label}\nPrevious key: ${displayFingerprint(savedFingerprint)}\nNew key: ${displayFingerprint(fingerprint)}\nVerify the server identity. Update the saved key and continue?`,
-      );
-      if (!trusted) { lastConnectionError = "The changed host key was rejected"; return null; }
-      saveKnownHost(key, fingerprint);
+    const targetCwd = cwd ?? configuredCwd(command);
+    if (!remote) {
+      lastCommand = command;
+      lastCwd = targetCwd;
+      persistSessionRemoteState();
     }
 
-    let password = getCachedPassword(parsed);
     ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `connecting ${endpointDisplayLabel(parsed)}…`));
     try {
-      let authentication = parsed.identityFile
-        ? await privateKeyAuthentication(parsed, ctx)
-        : standardAuthentication(password);
-      let next: RemoteState;
-      try {
-        next = await establish(parsed, authentication, cwd ?? configuredCwd(command));
-      } catch (error) {
-        if (parsed.identityFile || !/authentication methods failed|authentication failure/i.test((error as Error).message)) throw error;
-        password = await askPassword(ctx) ?? undefined;
-        if (!password) {
-          lastConnectionError = "No SSH password was provided and SSH agent authentication failed";
-          status(ctx);
-          return null;
-        }
-        authentication = standardAuthentication(password);
-        next = await establish(parsed, authentication, cwd ?? configuredCwd(command));
-      }
+      const next = await establish(parsed, targetCwd, ctx);
       const previous = remote?.client;
       remote = next;
       routeRemoteTools = true;
       previous?.end();
-      if (!parsed.identityFile && password) setCachedPassword(parsed, password);
       credentialCache.resume = { command, cwd: next.cwd, routeRemoteTools, forwards: [] };
       lastCommand = command;
+      lastCwd = next.cwd;
       lastConnectionError = undefined;
       saveEndpointConfig(command, { remoteCwd: next.cwd }, true);
       status(ctx);
       persistSessionRemoteState();
-      ctx.ui.notify(`SSH remote connected: ${endpointDisplayLabel(next)}:${next.cwd}`, "info");
+      if (next.unavailableCwd) {
+        ctx.ui.notify(`SSH remote directory unavailable: ${next.unavailableCwd}; connected in default directory ${next.cwd}`, "warning");
+      } else {
+        ctx.ui.notify(`SSH remote connected: ${endpointDisplayLabel(next, next.cwd)}`, "info");
+      }
       return next;
     } catch (error) {
-      if (!parsed.identityFile) deleteCachedPassword(parsed);
-      remote = null;
       lastConnectionError = (error as Error).message;
       status(ctx);
-      ctx.ui.notify(`SSH remote connection failed: ${lastConnectionError}`, "error");
+      ctx.ui.notify(`SSH remote connection failed: ${lastConnectionError.split("\n")[0]}`, "error");
       return null;
     }
   };
@@ -1188,9 +1197,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (remote) return remote;
     if (credentialCache.resume) return reconnectRemote();
     const command = lastCommand || activeSshCommand();
-    if (!command) throw new Error("No SSH endpoint configured; use /remote ssh USER@HOST -p PORT [-i KEY]");
+    if (!command) throw new Error("No SSH endpoint configured; use /remote ssh USER@HOST -p PORT [-i KEY] [-J [USER@]JUMP[:PORT][,...]]");
     const state = await connectInteractive(command, ctx, configuredCwd(command));
-    if (!state) throw new Error("SSH remote connection was cancelled or failed");
+    if (!state) throw new Error(lastConnectionError || "SSH remote connection was cancelled or failed");
     return state;
   };
 
@@ -1226,6 +1235,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   };
 
   const restoreSessionRemoteState = async (saved: SessionRemoteState, ctx: any): Promise<void> => {
+    lastCommand = saved.command ?? "";
+    lastCwd = saved.cwd;
     if (!saved.connected) {
       credentialCache.resume = undefined;
       status(ctx);
@@ -1243,6 +1254,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   const disconnect = (ctx: any, forgetCredentials = false) => {
     const previous = remote;
+    if (previous) {
+      lastCommand = previous.command;
+      lastCwd = previous.cwd;
+    }
     remote = null;
     routeRemoteTools = false;
     reconnectPromise = null;
@@ -1250,13 +1265,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     void stopForwards();
     if (forgetCredentials) {
       const configured = previous ?? (() => {
-        const command = activeSshCommand();
+        const command = lastCommand;
         if (!command) return undefined;
         try { return parseSshCommand(command); } catch { return undefined; }
       })();
       if (configured) {
-        deleteCachedPassword(configured);
-        deleteCachedKeyPassphrase(configured);
+        for (const hop of [...(configured.jumps ?? []), configured]) {
+          auth.forget(hop);
+        }
       }
     }
     previous?.client.end();
@@ -1356,7 +1372,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const localRead = createReadTool(localCwd);
   const localWrite = createWriteTool(localCwd);
   const localEdit = createEditTool(localCwd);
-  const localBash = createBashTool(localCwd);
+  let localBash = createBashTool(localCwd);
   const targetsLocalServerMemory = (path: unknown): boolean => {
     if (!remote || typeof path !== "string") return false;
     return resolve(path.replace(/^@/, "")) === serverMemoryFilePath(remote);
@@ -1364,17 +1380,29 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     ...localRead,
     name: "ssh_read",
-    description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue.`,
+    description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue. ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
     promptGuidelines: ["Use ssh_read with offset/limit for remote code and logs; inspect large files in focused chunks instead of reading them wholesale."],
     execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
       ? executeRemoteRead(id, params, signal, update)
       : localRead.execute(id, params, signal, update),
   });
-  pi.registerTool({ ...localWrite, execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path) ? createWriteTool(localCwd, { operations: remoteWriteOps() }).execute(id, params, signal, update) : localWrite.execute(id, params, signal, update) });
-  pi.registerTool({ ...localEdit, execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path) ? createEditTool(localCwd, { operations: remoteEditOps() }).execute(id, params, signal, update) : localEdit.execute(id, params, signal, update) });
+  pi.registerTool({
+    ...localWrite,
+    description: `${localWrite.description} ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
+    execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
+      ? createWriteTool(localCwd, { operations: remoteWriteOps() }).execute(id, params, signal, update)
+      : localWrite.execute(id, params, signal, update),
+  });
+  pi.registerTool({
+    ...localEdit,
+    description: `${localEdit.description} ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
+    execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
+      ? createEditTool(localCwd, { operations: remoteEditOps() }).execute(id, params, signal, update)
+      : localEdit.execute(id, params, signal, update),
+  });
   pi.registerTool({
     ...localBash,
-    description: `Execute a shell command. Remote model-facing output returns at most the last ${DEFAULT_EXEC_MAX_LINES} lines or ${formatSize(DEFAULT_EXEC_MAX_BYTES)} by default; complete oversized output is saved locally.`,
+    description: `Execute a shell command. Remote model-facing output returns at most the last ${DEFAULT_EXEC_MAX_LINES} lines or ${formatSize(DEFAULT_EXEC_MAX_BYTES)} by default; complete oversized output is saved locally. ${REMOTE_SHELL_TOOL_ROUTING_DESCRIPTION}`,
     promptGuidelines: ["When using bash for remote logs and broad searches, use bounded commands such as tail, sed, or rg with limits instead of cat or unbounded find output."],
     execute: async (id, params, signal, update) => {
       if (!remote || !routeRemoteTools) return localBash.execute(id, params, signal, update);
@@ -1386,10 +1414,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "remote",
     label: "Remote",
-    description: "Connect, reconnect, annotate endpoints, locate server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Server memory is managed as JSON entries with Pi's read, write, and edit tools. Connections support SSH agent, password, or an explicit local private key with -i. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords and key passphrases are never accepted as arguments and are cached only in process memory.",
+    description: "Connect, reconnect, annotate endpoints, locate server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Server memory is managed as JSON entries with Pi's read, write, and edit tools. Connections resolve ~/.ssh/config host aliases and per-hop keys, try SSH agent and private keys before passwords, and support an exclusive destination key with -i and jump hosts via -J or -o ProxyJump. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords and key passphrases are never accepted as arguments and are cached only in process memory.",
     promptSnippet: "Control the configured remote SSH connection, endpoint note and memory location, working directory, and local port forwarding",
     promptGuidelines: [
-      "Use remote when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
+      "Use remote when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment. Use action reconnect without command to restore the saved SSH route, including after disconnect; action status shows the full SSH command.",
       "Use remote with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
       "Use remote with action memory to locate and inspect the current server-memory JSON file, then use read/edit/write on that exact local path for entry-level changes.",
       "Delete a server-memory JSON entry only after an explicit user request to delete, remove, or forget it. Read the file first, identify the exact entry id, and remove only that object with edit; ask the user if the target is ambiguous and never infer deletion from an update request.",
@@ -1399,7 +1427,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "memory"] as const),
-      command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22 or ssh -i ~/.ssh/id_ed25519 root@host; optionally selects the endpoint for note or memory" })),
+      command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22, ssh -i ~/.ssh/id_ed25519 root@host, or ssh -J user@jump:22 root@host; optionally selects the endpoint for note or memory" })),
       note: Type.Optional(Type.String({ description: "Endpoint note for the note action; omit or use an empty string to clear it" })),
       cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
@@ -1410,17 +1438,20 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     async execute(_id, params, _signal, _update, ctx) {
       if (params.action === "status") {
         const mappings = [...forwardServers.keys()].sort((a, b) => a - b);
-        const text = `${remote ? `Connected: ${endpointDisplayLabel(remote)}:${remote.cwd}; tool routing: ${routeRemoteTools ? "remote" : "local"}` : "SSH remote is disconnected"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}`;
-        return { content: [{ type: "text", text }], details: { connected: Boolean(remote), cwd: remote?.cwd, toolRouting: routeRemoteTools ? "remote" : "local", forwardedPorts: mappings } };
+        const text = `${remote ? `Connected: ${endpointDisplayLabel(remote, remote.cwd)}; tool routing: ${routeRemoteTools ? "remote" : "local"}` : "SSH remote is disconnected"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}`;
+        return connectionResult(text, { forwardedPorts: mappings });
       }
       if (params.action === "disconnect" || params.action === "forget") {
         disconnect(ctx, params.action === "forget");
-        return { content: [{ type: "text", text: params.action === "forget" ? "Disconnected and forgot the cached credentials." : "Disconnected from SSH remote and returned to local tools." }], details: { connected: false } };
+        return connectionResult(params.action === "forget" ? "Disconnected and forgot the cached credentials." : "Disconnected from SSH remote and returned to local tools.");
       }
       if (params.action === "reconnect") {
-        if (!remote && !credentialCache.resume) throw new Error("No SSH remote connection is available to reconnect");
-        const state = await reconnectRemote();
-        return { content: [{ type: "text", text: `Reconnected: ${endpointDisplayLabel(state)}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
+        try {
+          const state = await reconnectRemote(ctx);
+          return connectionResult(`Reconnected: ${endpointDisplayLabel(state, state.cwd)}`);
+        } catch (error) {
+          return connectionErrorResult((error as Error).message);
+        }
       }
       if (params.action === "unforward") {
         await stopForwards();
@@ -1509,8 +1540,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       const command = params.command || lastCommand || activeSshCommand();
       if (!command) throw new Error(`No SSH endpoint configured. Set ${REMOTE_CONFIG_FILE} or pass command.`);
       const state = await connectInteractive(command, ctx, params.cwd ?? configuredCwd(command));
-      if (!state) throw new Error(lastConnectionError || "SSH remote connection was cancelled or failed");
-      return { content: [{ type: "text", text: `Connected: ${endpointDisplayLabel(state)}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
+      if (!state) return connectionErrorResult(lastConnectionError || "SSH remote connection was cancelled or failed");
+      return connectionResult(`Connected: ${endpointDisplayLabel(state, state.cwd)}`);
+    },
+    renderCall(params, theme) {
+      return renderRemoteControlCall(params, theme);
     },
     renderResult(result, { expanded }, theme) {
       return renderRemoteControlResult(result, expanded, theme);
@@ -1518,7 +1552,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("remote", {
-    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] [-i KEY] | memory | config | use USER@HOST:PORT | config note TEXT|--clear | config cwd PATH | config display-lines N | config read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
+    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] [-i KEY] [-J [USER@]JUMP[:PORT][,...]] | memory | config | use USER@HOST:PORT | config note TEXT|--clear | config cwd PATH | config display-lines N | config read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | disconnect | forget",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => getRemoteArgumentCompletions(prefix),
     handler: async (args, ctx) => {
       const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
       const action = input.toLowerCase();
@@ -1566,7 +1601,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const key = matches[0]!;
         const command = config.endpoints?.[key]?.sshCommand;
         if (!command) { ctx.ui.notify(`Endpoint has no SSH command: ${key}`, "error"); return; }
-        if (remote && cacheId(remote) !== key) {
+        if (remote && remote.command !== command) {
           const previous = remote;
           remote = null;
           routeRemoteTools = false;
@@ -1574,11 +1609,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           previous.client.end();
           await stopForwards();
           status(ctx);
-          persistSessionRemoteState();
         }
         saveRemoteConfig({ ...config, activeEndpoint: key });
         lastCommand = command;
-        ctx.ui.notify(`Selected SSH remote endpoint: ${key}; use /remote to connect`, "info");
+        lastCwd = configuredCwd(command);
+        persistSessionRemoteState();
+        ctx.ui.notify(`Selected SSH remote endpoint: ${endpointDisplayLabel(parseSshCommand(command))}; use /remote to connect`, "info");
         return;
       }
       if (/^config\s+note(?:\s+|$)/i.test(input)) {
@@ -1636,6 +1672,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const command = lastCommand || activeSshCommand();
         if (!command) { ctx.ui.notify("Configure an SSH endpoint first", "error"); return; }
         saveEndpointConfig(command, { remoteCwd });
+        lastCwd = remoteCwd;
+        persistSessionRemoteState();
         ctx.ui.notify(`Default SSH remote directory updated (${parseSshCommand(command).label}): ${remoteCwd}`, "info");
         return;
       }
@@ -1701,15 +1739,15 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         } catch (error) { ctx.ui.notify(`SSH remote command failed: ${(error as Error).message}`, "error"); }
         return;
       }
-      if (["off", "disconnect", "exit"].includes(action)) { disconnect(ctx); return; }
+      if (["disconnect", "off", "exit"].includes(action)) { disconnect(ctx); return; }
       if (action === "forget") { disconnect(ctx, true); return; }
       if (action === "status") {
-        ctx.ui.notify(remote ? `${endpointDisplayLabel(remote)}:${remote.cwd}` : "SSH remote is disconnected", "info");
+        ctx.ui.notify(connectionDescription(), "info");
         return;
       }
       if (["reload", "reconnect"].includes(action)) {
-        try { await reconnectRemote(); }
-        catch (error) { ctx.ui.notify(`SSH remote reconnection failed: ${(error as Error).message}`, "error"); }
+        try { await reconnectRemote(ctx); }
+        catch (error) { ctx.ui.notify(`SSH remote reconnection failed: ${(error as Error).message.split("\n")[0]}`, "error"); }
         return;
       }
       if (/^cd(?:\s+|$)/i.test(input)) {
@@ -1721,16 +1759,33 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         } catch (error) { ctx.ui.notify(`Failed to change SSH remote path: ${(error as Error).message}`, "error"); }
         return;
       }
-      const command = input || await ctx.ui.input("SSH command:", lastCommand);
-      if (!command) return;
-      await connectInteractive(command, ctx);
+      if (!input) {
+        const selected = lastCommand || activeSshCommand();
+        if (selected) {
+          await connectInteractive(selected, ctx);
+          return;
+        }
+        const prompted = await ctx.ui.input("SSH command:", lastCommand);
+        if (!prompted) return;
+        await connectInteractive(prompted, ctx);
+        return;
+      }
+      await connectInteractive(input, ctx);
     },
   });
 
   pi.on("turn_start", () => { turnOutputBytes = 0; });
   pi.on("session_start", async (event, ctx) => {
+    const settings = SettingsManager.create(ctx.cwd, getAgentDir(), {
+      projectTrusted: ctx.isProjectTrusted(),
+    });
+    localBash = createBashTool(ctx.cwd, {
+      shellPath: settings.getShellPath(),
+      commandPrefix: settings.getShellCommandPrefix(),
+    });
     currentCtx = ctx;
     sessionReady = true;
+    ctx.ui.addAutocompleteProvider(suppressRemoteCompletionsBeforeSuffix);
     status(ctx);
     const saved = loadSessionRemoteState(ctx);
     const canInheritCurrent = event.reason === "reload" || event.reason === "new" || event.reason === "fork";
@@ -1751,7 +1806,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     try {
       await restoreSessionRemoteState(target, ctx);
     } catch (error) {
-      ctx.ui.notify(`SSH remote session restore failed: ${(error as Error).message}`, "error");
+      ctx.ui.notify(`SSH remote session restore failed: ${(error as Error).message.split("\n")[0]}`, "error");
     } finally {
       restoringSessionState = false;
     }
@@ -1786,9 +1841,15 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return { result: { output: (error as Error).message, exitCode: 1, cancelled: false, truncated: false } };
     }
   });
-  pi.on("before_agent_start", (event) => remote && routeRemoteTools ? {
-    systemPrompt: remoteSystemPrompt(event.systemPrompt, localCwd, remote),
-  } : undefined);
+  pi.on("before_agent_start", (event) => {
+    if (remote || lastCommand) {
+      event.systemPromptOptions.sections.ssh_remote_connection = connectionDescription();
+    }
+    if (!remote || !routeRemoteTools) return;
+    event.systemPromptOptions.cwd = remote.cwd;
+    event.systemPromptOptions.sections.ssh_remote_workspace = remoteWorkspacePrompt(remote);
+    event.systemPromptOptions.sections.ssh_remote_memory_management = memoryManagementPrompt(remote);
+  });
   pi.on("context", (event) => {
     if (!remote || !routeRemoteTools) return undefined;
     const content = serverMemoryContext(remote);

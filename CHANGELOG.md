@@ -16,8 +16,65 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Fixed
 
+- None.
+
+## [0.1.15] - 2026-10-11
+
+### Added
+
+- Added per-host `~/.ssh/config` resolution for host aliases/patterns, connection settings, identity files/agent, and ProxyJump, with independent configuration for every hop.
+- Added default Ed25519, ECDSA, and RSA private-key discovery for destinations and jump hosts without requiring OpenSSH.
+
+### Changed
+
+- Try SSH agent and configured/default private keys before cached or prompted passwords; explicit destination `-i` remains exclusive.
+- Separated SSH configuration, authentication, and connection handling into focused TypeScript modules, with UI-independent credential prompting.
+- Kept connection-result UI to a fixed one-line summary, with full connection details available to the agent and through `/remote status`; jump connections include a compact `via` label.
+
+### Fixed
+
+- Suppressed `/remote` autocomplete while the cursor has non-whitespace command text after it, so Enter runs the existing command instead of inserting a duplicate completion.
+- Prevent `this.child.invalidate is not a function` crashes when Pi invalidates connection-result summaries, including historical results in resumed sessions, while preserving their fixed one-line display.
+- Avoid unnecessary password prompts on jump routes when a usable local default or configured private key is available.
+- Exposed the complete SSH command in agent context, connection/status/disconnect results, and connection failures instead of identifying jump-relative targets only by host and port.
+- Retained the saved SSH command and last remote directory after disconnect and session reload, allowing an explicit no-argument reconnect to rebuild the same route without automatically reconnecting a disconnected session.
+- Included the attempted SSH hop in connection-setup errors.
+
+## [0.1.14] - 2026-09-28
+
+### Added
+
+- Added `-J` and `-o ProxyJump=...` support for single and multi-hop SSH connections, with per-hop host-key verification and authentication, route-preserving reconnects, and full-chain cleanup.
+- Added Pi argument completion for `/remote` subcommands, saved endpoints, config keys, and exec flags, including preserving already-entered `/remote exec` options while completing later flags.
+
+### Changed
+
+- Removed automatic trailing spaces from `/remote` subcommand completions, leaving users to type the separator before entering the next argument.
+- Updated both README command examples and tables to use the canonical `/remote disconnect` command.
+
+### Fixed
+
+- Made bare `/remote` connect to the endpoint selected by `/remote use` instead of prompting again for an SSH command.
+- Stopped suggesting already-complete `/remote` arguments so Enter submits the command instead of accepting a redundant completion, including when the cursor is immediately after `ssh` before the connection arguments.
+- Preserved Pi's configured `shellPath` and `shellCommandPrefix` for local agent Bash commands, including after returning from SSH, and refreshed them when the session starts or reloads.
+- Rendered each `remote` tool action and its command or primary argument in the tool-call header instead of showing only the tool name, while omitting supplementary cwd, timeout, and endpoint context.
+- Made the active SSH directory and transparent `read`, `write`, `edit`, and `bash` routing explicit through structured prompt state and ordinary tool descriptions, instead of relying on an exact-text system-prompt replacement.
+
+## [0.1.13] - 2026-09-18
+
+### Added
+
+- None.
+
+### Changed
+
+- Increased the SSH handshake timeout to 30 seconds for slower remote connections.
+
+### Fixed
+
 - Stored SSH config, known hosts, and server memory in Pi's agent directory (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`) instead of falling back to the current working directory when `HOME` is unset, which mainly affected Windows.
 - Expanded `ssh -i ~/...` identity paths with the user home directory from `os.homedir()`, so private keys resolve on Windows.
+- Fell back to the remote login directory with a warning when a saved remote working directory is unavailable, instead of failing the SSH connection.
 
 ## [0.1.12] - 2026-08-25
 
@@ -221,7 +278,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.14...v0.1.15
+[0.1.14]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.13...v0.1.14
+[0.1.13]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.9...v0.1.10
